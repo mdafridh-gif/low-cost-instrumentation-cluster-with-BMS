@@ -1,0 +1,496 @@
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ILI9341.h>
+#include <Wire.h>
+#include <Adafruit_AHTX0.h>
+
+// TFT Pins
+#define TFT_CS   5
+#define TFT_RST  4
+#define TFT_DC   2
+
+Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_RST);
+
+// Sensors
+Adafruit_AHTX0 aht;
+
+#define VOLTAGE_PIN 35
+#define CURRENT_PIN 34
+
+// Calibration
+float voltageFactor  = 5.5;
+// ACS712 5A: sensitivity = 185mV/A = 0.185 V/A
+// NOTE: ACS712 5A is rated for max 5A continuous.
+// Your load may exceed this — readings above ~5A will saturate.
+// Upgrade to ACS712 20A (sensitivity 0.100) or ACS712 30A (0.066)
+// for accurate readings above 5A.
+float sensitivity    = 0.185;
+float offsetVoltage  = 2.5;     // ACS712 zero-current output = VCC/2 = 2.5V
+#define ACS712_MAX_A  5.0f      // Hard clamp — sensor rated limit
+
+// 12V Lead-Acid battery thresholds
+// Full charge (after charging): ~12.7V open circuit
+// Fully charged under float:    ~13.8V
+// Empty (cut-off):              ~11.8V (10.5V under load)
+float batteryCapacityWh = 84.0;   // 12V × 7Ah
+#define BATTERY_FULL_V  12.7f
+#define BATTERY_EMPTY_V 11.8f
+
+// ── Colour palette ──────────────────────────────────────────────────────────
+#define C_BG        0x0841   // very dark blue-grey
+#define C_PANEL     0x10A2   // dark card bg
+#define C_BORDER    0x2965   // subtle border
+#define C_WHITE     0xFFFF
+#define C_ACCENT    0x07FF   // cyan
+#define C_GREEN     0x07E0
+#define C_YELLOW    0xFFE0
+#define C_ORANGE    0xFD20
+#define C_RED       0xF800
+#define C_DIM       0x4A49   // muted text
+
+// ── Layout constants ─────────────────────────────────────────────────────────
+#define SCR_W  320
+#define SCR_H  240
+
+// Top header bar
+#define HDR_H   28
+
+// Card grid  (2 cols × 2 rows + bottom bar)
+#define CARD_W  148
+#define CARD_H   82
+#define CARD_GAP  4
+#define CARD_R    6    // corner radius
+#define COL1_X    4
+#define COL2_X   (COL1_X + CARD_W + CARD_GAP)
+#define ROW1_Y   (HDR_H + 4)
+#define ROW2_Y   (ROW1_Y + CARD_H + CARD_GAP)
+
+// Bottom status bar
+#define BAR_Y   (ROW2_Y + CARD_H + CARD_GAP)
+#define BAR_H   (SCR_H - BAR_Y - 2)
+
+// ── State ────────────────────────────────────────────────────────────────────
+float prevVoltage   = -1;
+float prevCurrent   = -1;
+float prevPower     = -1;
+float prevTemp      = -999;
+float prevHoursLeft = -1;
+int   prevBattPct   = -1;
+
+bool  lowVoltAlert  = false;
+bool  prevLowVolt   = false;
+uint8_t animFrame   = 0;
+uint32_t lastAnimMs = 0;
+uint32_t lastReadMs = 0;
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+float readADC(int pin)
+{
+  long total = 0;
+  for (int i = 0; i < 20; i++) { total += analogRead(pin); delay(2); }
+  return total / 20.0f;
+}
+
+// Map battery voltage to 0-100%
+int batteryPercent(float v)
+{
+  if (v <= BATTERY_EMPTY_V) return 0;
+  if (v >= BATTERY_FULL_V)  return 100;
+  return (int)((v - BATTERY_EMPTY_V) / (BATTERY_FULL_V - BATTERY_EMPTY_V) * 100.0f);
+}
+
+// Pick colour based on battery %
+uint16_t battColor(int pct)
+{
+  if (pct > 50) return C_GREEN;
+  if (pct > 25) return C_YELLOW;
+  if (pct > 10) return C_ORANGE;
+  return C_RED;
+}
+
+// Draw rounded rectangle (helper that handles both fill and border)
+void drawCard(int x, int y, int w, int h, uint16_t fillCol, uint16_t borderCol)
+{
+  tft.fillRoundRect(x, y, w, h, CARD_R, fillCol);
+  tft.drawRoundRect(x, y, w, h, CARD_R, borderCol);
+}
+
+// Small label + big value in a card
+void drawMetricCard(int x, int y, const char* label, const char* value,
+                    const char* unit, uint16_t valColor, bool forceRedraw)
+{
+  if (forceRedraw)
+  {
+    drawCard(x, y, CARD_W, CARD_H, C_PANEL, C_BORDER);
+    // Label
+    tft.setTextSize(1);
+    tft.setTextColor(C_DIM);
+    tft.setCursor(x + 8, y + 7);
+    tft.print(label);
+  }
+  // Clear value area
+  tft.fillRect(x + 4, y + 20, CARD_W - 8, CARD_H - 28, C_PANEL);
+  // Value
+  tft.setTextSize(3);
+  tft.setTextColor(valColor);
+  tft.setCursor(x + 8, y + 26);
+  tft.print(value);
+  // Unit
+  tft.setTextSize(1);
+  tft.setTextColor(C_DIM);
+  tft.setCursor(x + 8, y + CARD_H - 14);
+  tft.print(unit);
+}
+
+// Battery icon with fill level (top-right of header)
+void drawBatteryIcon(int x, int y, int pct, uint16_t col)
+{
+  const int BW = 36, BH = 16, NUB = 3;
+  tft.fillRect(x, y, BW + NUB, BH, C_PANEL);          // clear
+  tft.drawRect(x, y, BW, BH, col);                    // outline
+  tft.fillRect(x + BW, y + 4, NUB, BH - 8, col);      // nub
+  int fill = (int)(pct * (BW - 4) / 100.0f);
+  if (fill > 0) tft.fillRect(x + 2, y + 2, fill, BH - 4, col);
+}
+
+// Horizontal bar gauge (used for battery %)
+void drawGauge(int x, int y, int w, int h, int pct, uint16_t col)
+{
+  tft.drawRoundRect(x, y, w, h, 2, C_BORDER);
+  tft.fillRoundRect(x + 1, y + 1, w - 2, h - 2, 2, C_PANEL);
+  int fill = (int)(pct * (w - 4) / 100.0f);
+  if (fill > 0) tft.fillRoundRect(x + 2, y + 2, fill, h - 4, 2, col);
+}
+
+// ── Low Voltage Warning animation ────────────────────────────────────────────
+void drawLowVoltWarning(uint8_t frame)
+{
+  // Alternating red/orange flashing border + bolt icon
+  uint16_t flashCol = (frame % 2 == 0) ? C_RED : C_ORANGE;
+
+  // Flashing outer border
+  tft.drawRect(0, 0, SCR_W, SCR_H, flashCol);
+  tft.drawRect(1, 1, SCR_W - 2, SCR_H - 2, flashCol);
+
+  // Warning banner in bottom bar
+  tft.fillRect(4, BAR_Y, SCR_W - 8, BAR_H, (frame % 2 == 0) ? C_RED : 0x8000);
+
+  // Bolt symbol (simple triangle)
+  int bx = 14, by = BAR_Y + 3;
+  tft.fillTriangle(bx + 6, by, bx, by + 8, bx + 6, by + 8, C_YELLOW);
+  tft.fillTriangle(bx + 2, by + 7, bx + 8, by + 7, bx + 8, by + 14, C_YELLOW);
+
+  tft.setTextSize(1);
+  tft.setTextColor(C_YELLOW);
+  tft.setCursor(30, BAR_Y + 5);
+  tft.print("LOW VOLTAGE! RECHARGE BATTERY");
+}
+
+void clearWarningBorder()
+{
+  tft.drawRect(0, 0, SCR_W, SCR_H, C_BG);
+  tft.drawRect(1, 1, SCR_W - 2, SCR_H - 2, C_BG);
+}
+
+// ── Startup animation ─────────────────────────────────────────────────────────
+void bootAnimation()
+{
+  tft.fillScreen(C_BG);
+
+  // Sweep a cyan line down the screen
+  for (int y = 0; y < SCR_H; y += 4)
+  {
+    tft.drawFastHLine(0, y, SCR_W, C_ACCENT);
+    delay(8);
+    tft.drawFastHLine(0, y, SCR_W, C_BG);
+  }
+
+  // Logo / title fade-in (simulate by printing char by char)
+  const char* title = "BATTERY MONITOR";
+  tft.setTextSize(3);
+  tft.setTextColor(C_ACCENT);
+  int tx = (SCR_W - strlen(title) * 18) / 2;
+  for (int i = 0; i < (int)strlen(title); i++)
+  {
+    tft.setCursor(tx + i * 18, 80);
+    tft.print(title[i]);
+    delay(40);
+  }
+
+  tft.setTextSize(1);
+  tft.setTextColor(C_DIM);
+  tft.setCursor(90, 120);
+  tft.print("v2.0  ESP32 + AHT20");
+
+  // Loading bar
+  tft.drawRoundRect(40, 150, 240, 12, 3, C_BORDER);
+  for (int i = 0; i <= 236; i += 4)
+  {
+    tft.fillRoundRect(42, 152, i, 8, 2, C_ACCENT);
+    delay(6);
+  }
+  delay(300);
+  tft.fillScreen(C_BG);
+}
+
+// ── Draw static chrome (called once) ─────────────────────────────────────────
+void drawChrome()
+{
+  tft.fillScreen(C_BG);
+
+  // Header bar gradient (fake it with two rects)
+  tft.fillRect(0, 0, SCR_W, HDR_H, 0x0903);
+  tft.drawFastHLine(0, HDR_H - 1, SCR_W, C_ACCENT);
+
+  // Title
+  tft.setTextSize(1);
+  tft.setTextColor(C_ACCENT);
+  tft.setCursor(8, 10);
+  tft.print("BATT MONITOR");
+
+  // Card outlines (labels drawn here, values updated each loop)
+  drawCard(COL1_X, ROW1_Y, CARD_W, CARD_H, C_PANEL, C_BORDER);
+  tft.setTextSize(1); tft.setTextColor(C_DIM);
+  tft.setCursor(COL1_X + 8, ROW1_Y + 7); tft.print("VOLTAGE");
+
+  drawCard(COL2_X, ROW1_Y, CARD_W, CARD_H, C_PANEL, C_BORDER);
+  tft.setCursor(COL2_X + 8, ROW1_Y + 7); tft.print("CURRENT");
+
+  drawCard(COL1_X, ROW2_Y, CARD_W, CARD_H, C_PANEL, C_BORDER);
+  tft.setCursor(COL1_X + 8, ROW2_Y + 7); tft.print("POWER");
+
+  drawCard(COL2_X, ROW2_Y, CARD_W, CARD_H, C_PANEL, C_BORDER);
+  tft.setCursor(COL2_X + 8, ROW2_Y + 7); tft.print("TEMPERATURE");
+
+  // Bottom status bar placeholder
+  tft.fillRect(4, BAR_Y, SCR_W - 8, BAR_H, C_PANEL);
+  tft.drawRoundRect(4, BAR_Y, SCR_W - 8, BAR_H, 3, C_BORDER);
+}
+
+// ── Update only changed values ────────────────────────────────────────────────
+void updateDisplay(float voltage, float current, float power,
+                   float temp, float hoursLeft, int battPct, bool forceAll)
+{
+  char buf[16];
+  uint16_t col;
+
+  // ── Voltage card ──
+  if (forceAll || abs(voltage - prevVoltage) > 0.01f)
+  {
+    col = battColor(battPct);
+    dtostrf(voltage, 5, 2, buf);
+    // Clear + redraw value area only
+    tft.fillRect(COL1_X + 4, ROW1_Y + 20, CARD_W - 8, CARD_H - 50, C_PANEL);
+    tft.setTextSize(3); tft.setTextColor(col);
+    tft.setCursor(COL1_X + 8, ROW1_Y + 26);
+    tft.print(buf);
+    tft.setTextSize(1); tft.setTextColor(C_DIM);
+    tft.setCursor(COL1_X + 8, ROW1_Y + CARD_H - 28); tft.print("VOLTS");
+    // Gauge
+    drawGauge(COL1_X + 6, ROW1_Y + CARD_H - 18, CARD_W - 12, 10, battPct, col);
+    // Percent label
+    tft.fillRect(COL1_X + CARD_W - 38, ROW1_Y + CARD_H - 18, 36, 10, C_PANEL);
+    tft.setTextColor(col);
+    tft.setCursor(COL1_X + CARD_W - 34, ROW1_Y + CARD_H - 16);
+    tft.print(battPct); tft.print("%");
+    prevVoltage = voltage;
+    prevBattPct = battPct;
+  }
+
+  // ── Current card ──
+  if (forceAll || abs(current - prevCurrent) > 0.01f)
+  {
+    // ACS712 5A: red at limit (≥4.5A), orange mid (≥2.5A), cyan normal
+    col = (current >= ACS712_MAX_A - 0.5f) ? C_RED : (current > 2.5f) ? C_ORANGE : C_ACCENT;
+    dtostrf(current, 5, 2, buf);
+    tft.fillRect(COL2_X + 4, ROW1_Y + 20, CARD_W - 8, CARD_H - 28, C_PANEL);
+    tft.setTextSize(3); tft.setTextColor(col);
+    tft.setCursor(COL2_X + 8, ROW1_Y + 26); tft.print(buf);
+    tft.setTextSize(1); tft.setTextColor(C_DIM);
+    tft.setCursor(COL2_X + 8, ROW1_Y + CARD_H - 14); tft.print("AMPS");
+    prevCurrent = current;
+  }
+
+  // ── Power card ──
+  if (forceAll || abs(power - prevPower) > 0.1f)
+  {
+    col = (power > 50.0f) ? C_RED : (power > 20.0f) ? C_ORANGE : C_GREEN;
+    dtostrf(power, 5, 1, buf);
+    tft.fillRect(COL1_X + 4, ROW2_Y + 20, CARD_W - 8, CARD_H - 28, C_PANEL);
+    tft.setTextSize(3); tft.setTextColor(col);
+    tft.setCursor(COL1_X + 8, ROW2_Y + 26); tft.print(buf);
+    tft.setTextSize(1); tft.setTextColor(C_DIM);
+    tft.setCursor(COL1_X + 8, ROW2_Y + CARD_H - 14); tft.print("WATTS");
+    prevPower = power;
+  }
+
+  // ── Temperature card ──
+  if (forceAll || abs(temp - prevTemp) > 0.2f)
+  {
+    col = (temp > 40.0f) ? C_RED : (temp > 30.0f) ? C_ORANGE : C_ACCENT;
+    dtostrf(temp, 4, 1, buf);
+    tft.fillRect(COL2_X + 4, ROW2_Y + 20, CARD_W - 8, CARD_H - 28, C_PANEL);
+    tft.setTextSize(3); tft.setTextColor(col);
+    tft.setCursor(COL2_X + 8, ROW2_Y + 26); tft.print(buf);
+    tft.setTextSize(1); tft.setTextColor(C_DIM);
+    tft.setCursor(COL2_X + 8, ROW2_Y + CARD_H - 14); tft.print("CELSIUS");
+    prevTemp = temp;
+  }
+
+  // ── Battery icon in header ──
+  if (forceAll || battPct != prevBattPct)
+  {
+    col = battColor(battPct);
+    drawBatteryIcon(SCR_W - 52, 6, battPct, col);
+    // % text next to icon
+    tft.fillRect(SCR_W - 88, 8, 34, 12, 0x0903);
+    tft.setTextSize(1); tft.setTextColor(col);
+    tft.setCursor(SCR_W - 88, 10);
+    tft.print(battPct); tft.print("%");
+  }
+
+  // ── Time-remaining in header ──
+  if (forceAll || abs(hoursLeft - prevHoursLeft) > 0.05f)
+  {
+    tft.fillRect(90, 4, 130, 20, 0x0903);
+    tft.setTextSize(1); tft.setTextColor(C_WHITE);
+    tft.setCursor(92, 10);
+    if (hoursLeft <= 0 || power < 0.1f)
+    {
+      tft.setTextColor(C_DIM);
+      tft.print("-- h remain");
+    }
+    else if (hoursLeft > 99)
+    {
+      tft.print(">99 h remain");
+    }
+    else
+    {
+      int hh = (int)hoursLeft;
+      int mm = (int)((hoursLeft - hh) * 60);
+      char tbuf[16];
+      sprintf(tbuf, "%dh %02dm remain", hh, mm);
+      tft.print(tbuf);
+    }
+    prevHoursLeft = hoursLeft;
+  }
+}
+
+// ── Normal status bar ─────────────────────────────────────────────────────────
+void drawStatusBar(float power, int battPct, float current)
+{
+  tft.fillRect(4, BAR_Y, SCR_W - 8, BAR_H, C_PANEL);
+  tft.drawRoundRect(4, BAR_Y, SCR_W - 8, BAR_H, 3, C_BORDER);
+
+  tft.setTextSize(1);
+  tft.setCursor(14, BAR_Y + 5);
+
+  // Sensor overload takes priority
+  if (current >= ACS712_MAX_A - 0.1f)
+  {
+    tft.setTextColor(C_RED);
+    tft.print("CURRENT SENSOR OVERLOAD! (>5A)");
+  }
+  else if (battPct > 80)      { tft.setTextColor(C_GREEN);  tft.print("Battery Good  -  System Normal"); }
+  else if (battPct > 50)      { tft.setTextColor(C_GREEN);  tft.print("Battery OK  -  Discharging"); }
+  else if (battPct > 25)      { tft.setTextColor(C_YELLOW); tft.print("Battery Low  -  Consider Charging"); }
+  else if (battPct > 10)      { tft.setTextColor(C_ORANGE); tft.print("Battery Very Low!"); }
+  else                        { tft.setTextColor(C_RED);    tft.print("CRITICAL: Connect Charger NOW"); }
+
+  // Alive pulse dot
+  uint16_t pulse = (millis() / 500) % 2 == 0 ? C_ACCENT : C_PANEL;
+  tft.fillCircle(SCR_W - 12, BAR_Y + BAR_H / 2, 3, pulse);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+void setup()
+{
+  Serial.begin(115200);
+  Wire.begin(21, 22);
+  aht.begin();
+
+  tft.begin();
+  tft.setRotation(1);
+
+  bootAnimation();
+  drawChrome();
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+void loop()
+{
+  uint32_t now = millis();
+
+  // ── Sensor read every 1 s ──────────────────────────────────────────────
+  if (now - lastReadMs >= 1000)
+  {
+    lastReadMs = now;
+
+    // Voltage
+    float raw        = readADC(VOLTAGE_PIN);
+    float adcVoltage = raw * (3.3f / 4095.0f);
+    float voltage    = adcVoltage * voltageFactor;
+    if (voltage < 0.5f) voltage = 0;
+
+    // Current — ACS712 5A
+    // Formula: I = (Vsensor - Voffset) / sensitivity
+    // ACS712 zero-current output = 2.5V, sensitivity = 185mV/A
+    float cRaw     = readADC(CURRENT_PIN);
+    float cVolt    = cRaw * (3.3f / 4095.0f);
+    float current  = (cVolt - offsetVoltage) / sensitivity;
+    if (current < 0)           current = 0;          // load only, no negative
+    if (current < 0.08f)       current = 0;          // noise floor
+    if (current > ACS712_MAX_A) current = ACS712_MAX_A; // clamp at sensor rated limit
+
+    // Power & time
+    float power     = voltage * current;
+    float hoursLeft = (power > 0) ? batteryCapacityWh / power : 0;
+
+    // Temperature
+    sensors_event_t humidity, temp;
+    aht.getEvent(&humidity, &temp);
+    float temperature = temp.temperature;
+
+    // Battery %
+    int bpct = batteryPercent(voltage);
+
+    // Low voltage threshold
+    lowVoltAlert = (voltage > 0.5f && voltage < BATTERY_EMPTY_V + 0.3f);
+
+    // Update cards
+    bool forceAll = (prevBattPct == -1);  // first run
+    updateDisplay(voltage, current, power, temperature, hoursLeft, bpct, forceAll);
+
+    // Status bar (only when not in alert)
+    if (!lowVoltAlert)
+    {
+      if (prevLowVolt)
+      {
+        // Just recovered — redraw chrome
+        drawChrome();
+        clearWarningBorder();
+      }
+      drawStatusBar(power, bpct, current);
+      prevLowVolt = false;
+    }
+    else
+    {
+      prevLowVolt = true;
+    }
+
+    Serial.print("V:"); Serial.print(voltage, 2);
+    Serial.print("  A:"); Serial.print(current, 2);
+    Serial.print("  W:"); Serial.print(power, 2);
+    Serial.print("  T:"); Serial.println(temperature, 1);
+  }
+
+  // ── Low voltage animation every 400 ms ─────────────────────────────────
+  if (lowVoltAlert && (now - lastAnimMs >= 400))
+  {
+    lastAnimMs = now;
+    animFrame++;
+    drawLowVoltWarning(animFrame);
+  }
+
+  delay(20);
+}
